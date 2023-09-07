@@ -17,11 +17,15 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/libp2p/go-libp2p/core/routing"
+	quic "github.com/libp2p/go-libp2p/p2p/transport/quic"
+	"github.com/libp2p/go-libp2p/p2p/transport/tcp"
+	ws "github.com/libp2p/go-libp2p/p2p/transport/websocket"
+	webtransport "github.com/libp2p/go-libp2p/p2p/transport/webtransport"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/urfave/cli/v2"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/prometheus"
-	metric "go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/metric"
 	metricsdk "go.opentelemetry.io/otel/sdk/metric"
 	"golang.org/x/exp/slog"
 )
@@ -32,6 +36,7 @@ var cfg = Config{
 	ProtocolID:     string(kaddht.ProtocolDHT),
 	MetricsHost:    "127.0.0.1",
 	MetricsPort:    3232,
+	transports:     cli.NewStringSlice(),
 }
 
 type Config struct {
@@ -40,6 +45,7 @@ type Config struct {
 	BootstrapPeers *cli.StringSlice
 	MetricsHost    string
 	MetricsPort    int
+	transports     *cli.StringSlice
 }
 
 func (c Config) String() string {
@@ -62,6 +68,13 @@ func (c Config) BootstrapAddrInfos() ([]peer.AddrInfo, error) {
 		bootstrappers[i] = *addrInfo
 	}
 	return bootstrappers, nil
+}
+
+func (c Config) Transports() []string {
+	if c.transports == nil || len(c.transports.Value()) == 0 {
+		return []string{"tcp", "quic", "ws", "wt"}
+	}
+	return c.transports.Value()
 }
 
 func main() {
@@ -106,6 +119,13 @@ func main() {
 				Destination: &cfg.ProbeInterval,
 				EnvVars:     []string{"BOOMO_PROBE_INTERVAL"},
 			},
+			&cli.StringSliceFlag{
+				Name:        "transports",
+				Usage:       "the transports to probe",
+				Value:       cfg.transports,
+				Destination: cfg.transports,
+				EnvVars:     []string{"BOOMO_TRANSPORTS"},
+			},
 		},
 	}
 
@@ -128,8 +148,15 @@ func main() {
 	}
 }
 
+type hostRef struct {
+	host host.Host
+	trpt string
+	pm   *dht_pb.ProtocolMessenger
+}
+
 func rootAction(c *cli.Context) error {
-	slog.Info("Starting to monitor bootstrappers")
+	slog.Info("Starting to monitor bootstrappers with configuration:")
+	fmt.Println(cfg.String())
 
 	exporter, err := prometheus.New()
 	if err != nil {
@@ -148,21 +175,46 @@ func rootAction(c *cli.Context) error {
 		return fmt.Errorf("parse peer strings: %w", err)
 	}
 
-	var d *kaddht.IpfsDHT
-	h, err := libp2p.New(
-		libp2p.NoListenAddrs,
-		libp2p.Routing(func(h host.Host) (routing.PeerRouting, error) {
-			d, err = kaddht.New(c.Context, h, kaddht.Mode(kaddht.ModeClient))
-			return d, err
-		}),
-	)
-	if err != nil {
-		return fmt.Errorf("new libp2p host: %w", err)
-	}
+	hosts := map[string]*hostRef{}
+	for _, trpt := range cfg.Transports() {
+		var transportOpt libp2p.Option
+		switch trpt {
+		case "tcp":
+			transportOpt = libp2p.Transport(tcp.NewTCPTransport)
+		case "quic":
+			transportOpt = libp2p.Transport(quic.NewTransport)
+		case "ws":
+			transportOpt = libp2p.Transport(ws.New)
+		case "wt":
+			transportOpt = libp2p.Transport(webtransport.New)
+		default:
+			return fmt.Errorf("unknown transport: %s", trpt)
+		}
 
-	pm, err := dht_pb.NewProtocolMessenger(NewMessageSenderImpl(h, []protocol.ID{protocol.ID(cfg.ProtocolID)}))
-	if err != nil {
-		return err
+		var d *kaddht.IpfsDHT
+		h, err := libp2p.New(
+			transportOpt,
+			libp2p.NoListenAddrs,
+			libp2p.Routing(func(h host.Host) (routing.PeerRouting, error) {
+				d, err = kaddht.New(c.Context, h, kaddht.Mode(kaddht.ModeClient))
+				return d, err
+			}),
+		)
+		if err != nil {
+			return fmt.Errorf("new libp2p host: %w", err)
+		}
+
+		pm, err := dht_pb.NewProtocolMessenger(NewMessageSenderImpl(h, []protocol.ID{protocol.ID(cfg.ProtocolID)}))
+		if err != nil {
+			return err
+		}
+
+		slog.Info("Initialized new libp2p host", "peerID", h.ID().String(), "transport", trpt)
+		hosts[trpt] = &hostRef{
+			host: h,
+			trpt: trpt,
+			pm:   pm,
+		}
 	}
 
 	for {
@@ -173,49 +225,53 @@ func rootAction(c *cli.Context) error {
 		case <-time.After(cfg.ProbeInterval):
 		}
 
-		for _, addrInfo := range bootstrappers {
-			select {
-			case <-c.Context.Done():
-				return c.Context.Err()
-			default:
-			}
+		for _, ref := range hosts {
+			for _, addrInfo := range bootstrappers {
+				select {
+				case <-c.Context.Done():
+					return c.Context.Err()
+				default:
+				}
 
-			slogEntry := slog.With("peer", addrInfo.ID.String())
+				slogEntry := slog.With("peer", addrInfo.ID.String(), "transport", ref.trpt)
 
-			if err := forgetPeer(h, addrInfo.ID); err != nil {
-				slogEntry.Warn("failed forgetting peer", "err", err.Error())
-				continue
-			}
+				if err := forgetPeer(ref.host, addrInfo.ID); err != nil {
+					slogEntry.Warn("failed forgetting peer", "err", err.Error())
+					continue
+				}
 
-			slogEntry.Info("Connecting")
-			err := h.Connect(c.Context, addrInfo)
-			mattrs := metric.WithAttributes(
-				attribute.Bool("success", err == nil),
-				attribute.String("peer", addrInfo.ID.String()),
-				attribute.String("type", "CONNECT"),
-			)
-			probeIns.Add(c.Context, 1, mattrs)
-			if err != nil {
-				slogEntry.Warn("failed connecting to peer", "err", err.Error())
-				continue
-			}
+				slogEntry.Info("Connecting")
+				err := ref.host.Connect(c.Context, addrInfo)
+				mattrs := metric.WithAttributes(
+					attribute.Bool("success", err == nil),
+					attribute.String("peer", addrInfo.ID.String()),
+					attribute.String("type", "CONNECT"),
+					attribute.String("transport", ref.trpt),
+				)
+				probeIns.Add(c.Context, 1, mattrs)
+				if err != nil {
+					slogEntry.Warn("failed connecting to peer", "err", err.Error())
+					continue
+				}
 
-			slogEntry.Info("Getting closer peers")
-			closer, err := pm.GetClosestPeers(c.Context, addrInfo.ID, h.ID())
-			mattrs = metric.WithAttributes(
-				attribute.Bool("success", err == nil && len(closer) != 0),
-				attribute.String("peer", addrInfo.ID.String()),
-				attribute.String("type", "FIND_NODE"),
-			)
-			probeIns.Add(c.Context, 1, mattrs)
-			if err != nil {
-				slogEntry.Warn("failed getting closer peers", "err", err.Error())
-			}
+				slogEntry.Info("Getting closer peers")
+				closer, err := ref.pm.GetClosestPeers(c.Context, addrInfo.ID, ref.host.ID())
+				mattrs = metric.WithAttributes(
+					attribute.Bool("success", err == nil && len(closer) != 0),
+					attribute.String("peer", addrInfo.ID.String()),
+					attribute.String("type", "FIND_NODE"),
+					attribute.String("transport", ref.trpt),
+				)
+				probeIns.Add(c.Context, 1, mattrs)
+				if err != nil {
+					slogEntry.Warn("failed getting closer peers", "err", err.Error())
+				}
 
-			slogEntry.Info("Disconnecting from peer")
-			if err := forgetPeer(h, addrInfo.ID); err != nil {
-				slogEntry.Warn("failed forgetting peer", "err", err.Error())
-				continue
+				slogEntry.Info("Disconnecting from peer")
+				if err := forgetPeer(ref.host, addrInfo.ID); err != nil {
+					slogEntry.Warn("failed forgetting peer", "err", err.Error())
+					continue
+				}
 			}
 		}
 	}
