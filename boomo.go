@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
+	"sync"
 	"syscall"
 	"time"
 
@@ -71,10 +73,16 @@ func (c Config) BootstrapAddrInfos() ([]peer.AddrInfo, error) {
 }
 
 func (c Config) Transports() []string {
+	var transports []string
 	if c.transports == nil || len(c.transports.Value()) == 0 {
-		return []string{"tcp", "quic", "ws", "wt"}
+		transports = []string{"tcp", "quic", "ws", "wt"}
+	} else {
+		transports = c.transports.Value()
 	}
-	return c.transports.Value()
+
+	sort.Strings(transports)
+
+	return transports
 }
 
 func main() {
@@ -165,11 +173,6 @@ func rootAction(c *cli.Context) error {
 	meterProvider := metricsdk.NewMeterProvider(metricsdk.WithReader(exporter))
 	meter := meterProvider.Meter("github.com/plprobelab/boomo")
 
-	probeIns, err := meter.Int64Counter("probes")
-	if err != nil {
-		return fmt.Errorf("checks meter: %w", err)
-	}
-
 	bootstrappers, err := cfg.BootstrapAddrInfos()
 	if err != nil {
 		return fmt.Errorf("parse peer strings: %w", err)
@@ -217,6 +220,40 @@ func rootAction(c *cli.Context) error {
 		}
 	}
 
+	var upStateMu sync.RWMutex
+	upState := map[string]map[peer.ID]int64{}
+	for _, t := range cfg.Transports() {
+		for _, p := range bootstrappers {
+			if _, found := upState[t]; !found {
+				upState[t] = map[peer.ID]int64{}
+			}
+			upState[t][p.ID] = 0
+		}
+	}
+
+	probeIns, err := meter.Int64Counter("boomo_probes")
+	if err != nil {
+		return fmt.Errorf("boomo_probes meter: %w", err)
+	}
+
+	_, err = meter.Int64ObservableGauge("boomo_up", metric.WithInt64Callback(func(ctx context.Context, o metric.Int64Observer) error {
+		upStateMu.RLock()
+		defer upStateMu.RUnlock()
+
+		for trpt, peers := range upState {
+			for p, up := range peers {
+				o.Observe(up, metric.WithAttributes(
+					attribute.String("peer", p.String()),
+					attribute.String("transport", trpt),
+				))
+			}
+		}
+		return nil
+	}))
+	if err != nil {
+		return fmt.Errorf("boomo_up meter: %w", err)
+	}
+
 	for {
 		slog.Info("Sleeping until next probe...", "duration", cfg.ProbeInterval)
 		select {
@@ -249,6 +286,15 @@ func rootAction(c *cli.Context) error {
 					attribute.String("transport", ref.trpt),
 				)
 				probeIns.Add(c.Context, 1, mattrs)
+
+				upStateMu.Lock()
+				if err == nil {
+					upState[ref.trpt][addrInfo.ID] = 1
+				} else {
+					upState[ref.trpt][addrInfo.ID] = 0
+				}
+				upStateMu.Unlock()
+
 				if err != nil {
 					slogEntry.Warn("failed connecting to peer", "err", err.Error())
 					continue
