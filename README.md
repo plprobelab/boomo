@@ -1,29 +1,42 @@
-# `boomo`
+# 💥 `boomo`
 
 `boomo` is a **boo**trapper **mo**nitor. It will probe a list of preconfigured
-peers in a constant interval.
+peers at a constant frequency with different transports.
 
-In each round it loops through all peers and
+In each round, it loops through the configured transports and peers and does two things. It
 
-1. establishes a connection
-2. issues a `FIND_NODE` RPC
+1. establishes a connection (using a single transport)
+2. issues a `FIND_NODE` RPC (if the connection was successful).
 
-The process exposes a single prometheus metric that will indicate the
-availability of the configured peers:
+By default, TCP, QUIC, Websocket, and WebTransport are configured.
 
-```text
-probes_total{otel_scope_name="github.com/plprobelab/boomo",otel_scope_version="",peer="QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",success="true",type="CONNECT"} 1
-probes_total{otel_scope_name="github.com/plprobelab/boomo",otel_scope_version="",peer="QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",success="true",type="FIND_NODE"} 1
-probes_total{otel_scope_name="github.com/plprobelab/boomo",otel_scope_version="",peer="QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa",success="true",type="CONNECT"} 1
-probes_total{otel_scope_name="github.com/plprobelab/boomo",otel_scope_version="",peer="QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa",success="true",type="FIND_NODE"} 1
-```
+The process exposes two prometheus metrics that will indicate the
+availability of probed peers:
 
-Beware of the metric cardinality when configuring many peers to probe.
+1. A counter that tracks the performed probes
 
-Before and after a peer is probed `boomo` will actively disconnect from it and
-remove the peer's addresses from the peerstore. The intention here is that this
-will trigger another DNS lookup in case the configured peers use `/dnsaddr/`
-multiaddresses.
+   ```text
+   boomo_probes_total{peer="QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",success="true",type="CONNECT",transport="tcp"} 1
+   boomo_probes_total{peer="QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",success="true",type="FIND_NODE",transport="tcp"} 1
+   boomo_probes_total{peer="QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa",success="true",type="CONNECT",transport="tcp"} 1
+   boomo_probes_total{peer="QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa",success="true",type="FIND_NODE",transport="tcp"} 1
+   ```
+   
+   `CONNECT` counts the established connections to a peer by transport/success. `FIND_NODE` counts the number of `FIND_NODE` RPCs to a peer by transport/success.
+
+2. A gauge indicating if a probed peer is considered online by transport:
+
+   ```text
+   boomo_up{peer="QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",transport="quic"} 1
+   boomo_up{peer="QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",transport="tcp"} 0
+   boomo_up{peer="QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",transport="ws"} 0
+   boomo_up{peer="QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",transport="wt"} 0
+   ```
+
+Beware of the metric cardinality when configuring many peers/more transports to probe.
+
+Before and after a peer is probed `boomo` will actively disconnect from a peer and
+remove the peer's addresses from the peerstore.
 
 **Note:** the [`msg_sender.go`](./msg_sender.go) file was just copied from [`go-libp2p-kad-dht`](https://github.com/libp2p/go-libp2p-kad-dht/blob/master/internal/net/message_manager.go). It is an `internal` package there, so it cannot be imported straight away. 
 
@@ -31,7 +44,7 @@ multiaddresses.
 
 By default `boomo` will
 
-1. probe the bootstrap peers of the Amino DHT:
+1. Probe the bootstrap peers of the Amino DHT:
 
     ```text
     /dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN
@@ -40,9 +53,11 @@ By default `boomo` will
     /dnsaddr/bootstrap.libp2p.io/p2p/QmcZf59bWwK5XFi76CZX8cbJ4BhTzzA3gU1ZjYZcYW3dwt
     /ip4/104.131.131.82/tcp/4001/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ
     ```
+   
 2. Use the `/ipfs/kad/1.0.0` protocol ID
+3. Probe with the TCP, QUIC, Websocket and WebTransport transports
 3. Run a round of probes every `5 minutes`
-4. Expose the prometheus metrics on port `3232`
+4. Expose prometheus metrics on port `3232`
 
 ## Run
 
@@ -71,11 +86,11 @@ COMMANDS:
    help, h  Shows a list of commands or help for one command
 
 GLOBAL OPTIONS:
-   --peers value [ --peers value ]  peer multiaddresses (network address + peer ID) (default: IPFS bootstrappers) [$BOOMO_PEERS]
-   --protocol value                 the libp2p protocol for the DHT (default: "/ipfs/kad/1.0.0") [$BOOMO_PROTOCOL]
-   --metrics-host value             the network musa metrics should bind on (default: "127.0.0.1") [$BOOMO_METRICS_HOST]
-   --metrics-port value             the port on which musa metrics should listen on (default: 3232) [$BOOMO_METRICS_PORT]
-   --probe-interval value           probe interval (default: 5m0s) [$BOOMO_PROBE_INTERVAL]
-   --help, -h                       show help
-
+   --peers value [ --peers value ]            peer multiaddresses (network address + peer ID) (default: IPFS bootstrappers) [$BOOMO_PEERS]
+   --protocol value                           the libp2p protocol for the DHT (default: "/ipfs/kad/1.0.0") [$BOOMO_PROTOCOL]
+   --metrics-host value                       the network musa metrics should bind on (default: "127.0.0.1") [$BOOMO_METRICS_HOST]
+   --metrics-port value                       the port on which musa metrics should listen on (default: 3232) [$BOOMO_METRICS_PORT]
+   --probe-interval value                     probe interval (default: 5m0s) [$BOOMO_PROBE_INTERVAL]
+   --transports value [ --transports value ]  the transports to probe [$BOOMO_TRANSPORTS]
+   --help, -h                                 show help
 ```
